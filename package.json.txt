@@ -1,0 +1,12 @@
+{
+  "name": "asaas-payment-api",
+  "version": "1.0.0",
+  "description": "API Route para processamento de PIX via Asaas",
+  "main": "api/processar-pagamento.js",
+  "scripts": {
+    "start": "vercel dev"
+  },
+  "dependencies": {
+    "axios": "^1.6.8"
+  }
+}
