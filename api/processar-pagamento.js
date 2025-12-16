@@ -114,6 +114,7 @@ async function processarPagamentoAsaas(req, res) {
         return res.status(200).json({
             status: 'success',
             paymentId: paymentId,
+            customer: customerId,
             qrCode: pixQrCodeResponse.data.encodedImage, // base64 para exibir no <img>
             payload: pixQrCodeResponse.data.payload,       // Pix Copia e Cola
             expirationDate: pixQrCodeResponse.data.expirationDate
