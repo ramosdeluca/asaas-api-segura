@@ -1,58 +1,136 @@
 const { createClient } = require('@supabase/supabase-js');
 
-// Conecta ao Supabase usando as variáveis de ambiente
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// 🔧 REGRAS DE NEGÓCIO
+const CREDITOS_MENSAIS = 1000;
+
 module.exports = async (req, res) => {
-  // 1. O Asaas sempre envia via POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Apenas POST é permitido' });
   }
 
-  // 2. Captura o evento e os dados do pagamento vindos do Asaas
   const { event, payment } = req.body;
 
-  console.log(`Evento recebido: ${event} | ID Pagamento: ${payment.id}`);
+  if (!event || !payment?.id) {
+    return res.status(400).json({ error: 'Payload inválido' });
+  }
 
-  // 3. Define a lógica de conversão de status
-  const eventosSucesso = ['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'];
-  const eventosFalha = ['PAYMENT_OVERDUE', 'PAYMENT_DELETED', 'PAYMENT_REFUNDED'];
-  const eventosCancelamento = ['SUBSCRIPTION_INACTIVATED'];
+  console.log(`[ASAAS] Evento: ${event} | Payment: ${payment.id}`);
 
   try {
-    let novoStatus = null;
+    // =================================================
+    // 1️⃣ BUSCA PAGAMENTO ATUAL (IDEMPOTÊNCIA)
+    // =================================================
+    const { data: pagamentoAtual, error: fetchError } = await supabase
+      .from('payments')
+      .select('status, paid_at')
+      .eq('asaas_id', payment.id)
+      .single();
 
-    if (eventosSucesso.includes(event)) {
-      novoStatus = 'RECEIVED';
-    } else if (eventosFalha.includes(event)) {
-      novoStatus = 'SUSPEND';
-    } else if (eventosCancelamento.includes(event)) {
-      novoStatus = 'CANCELLED';
+    if (fetchError) {
+      console.error('[ASAAS] Pagamento não encontrado:', fetchError.message);
+      return res.status(404).send('Pagamento não encontrado');
     }
 
-    // 4. Se for um evento que queremos tratar, atualizamos a tabela
-    if (novoStatus) {
-      const { data, error } = await supabase
+    // =================================================
+    // 2️⃣ ATUALIZA STATUS DO PAGAMENTO
+    // =================================================
+    let novoStatusPagamento = pagamentoAtual.status;
+    let marcarComoPago = false;
+
+    if (event === 'PAYMENT_CONFIRMED') {
+      novoStatusPagamento = 'RECEIVED';
+    }
+
+    if (event === 'PAYMENT_RECEIVED') {
+      novoStatusPagamento = 'RECEIVED';
+      marcarComoPago = true;
+    }
+
+    if (event === 'PAYMENT_OVERDUE') {
+      novoStatusPagamento = 'SUSPENDED';
+    }
+
+    if (event === 'PAYMENT_REFUNDED') {
+      novoStatusPagamento = 'CANCELLED';
+    }
+
+    if (novoStatusPagamento !== pagamentoAtual.status || marcarComoPago) {
+      await supabase
         .from('payments')
-        .update({ status: novoStatus })
-        .eq('asaas_id', payment.id); // Encontra a linha pelo asaas_id
-
-      if (error) {
-        console.error('Erro ao atualizar Supabase:', error.message);
-        return res.status(500).json({ error: 'Erro no banco de dados' });
-      }
-
-      console.log(`Pagamento ${payment.id} atualizado com sucesso no Supabase para: ${novoStatus}`);
+        .update({
+          status: novoStatusPagamento,
+          paid_at: marcarComoPago && !pagamentoAtual.paid_at
+            ? new Date().toISOString()
+            : pagamentoAtual.paid_at
+        })
+        .eq('asaas_id', payment.id);
     }
 
-    // 5. Avisa o Asaas que recebemos a mensagem com sucesso
+    // =================================================
+    // 3️⃣ RENOVA CICLO E CRÉDITOS (SÓ UMA VEZ)
+    // =================================================
+    if (
+      event === 'PAYMENT_RECEIVED' &&
+      payment.subscription &&
+      !pagamentoAtual.paid_at
+    ) {
+      const inicioCiclo = new Date();
+      const fimCiclo = payment.dueDate
+        ? new Date(payment.dueDate + 'T23:59:59')
+        : null;
+
+      await supabase
+        .from('profiles')
+        .update({
+          subscription_status: 'ACTIVE',
+          credits_total: CREDITOS_MENSAIS,
+          credits_remaining: CREDITOS_MENSAIS,
+          current_period_start: inicioCiclo.toISOString(),
+          current_period_end: fimCiclo ? fimCiclo.toISOString() : null
+        })
+        .eq('subscription', payment.subscription);
+
+      console.log(`[ASAAS] Ciclo renovado com sucesso`);
+    }
+
+    // =================================================
+    // 4️⃣ INADIMPLÊNCIA → SUSPENDE ASSINATURA
+    // =================================================
+    if (event === 'PAYMENT_OVERDUE' && payment.subscription) {
+      await supabase
+        .from('profiles')
+        .update({
+          subscription_status: 'SUSPENDED'
+        })
+        .eq('subscription', payment.subscription);
+
+      console.log('[ASAAS] Assinatura suspensa por inadimplência');
+    }
+
+    // =================================================
+    // 5️⃣ CANCELAMENTO DEFINITIVO
+    // =================================================
+    if (event === 'SUBSCRIPTION_INACTIVATED' && payment.subscription) {
+      await supabase
+        .from('profiles')
+        .update({
+          subscription_status: 'CANCELLED',
+          credits_remaining: 0
+        })
+        .eq('subscription', payment.subscription);
+
+      console.log('[ASAAS] Assinatura cancelada');
+    }
+
     return res.status(200).send('OK');
 
   } catch (err) {
-    console.error('Erro no processamento:', err.message);
+    console.error('[ASAAS] Erro no webhook:', err);
     return res.status(500).send('Erro interno');
   }
 };
