@@ -19,7 +19,8 @@ module.exports = async (req, res) => {
 
   // 3. Define a lógica de conversão de status
   const eventosSucesso = ['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'];
-  const eventosFalha = ['PAYMENT_OVERDUE', 'PAYMENT_DELETED', 'PAYMENT_REFUNDED', 'SUBSCRIPTION_INACTIVATED'];
+  const eventosFalha = ['PAYMENT_OVERDUE', 'PAYMENT_DELETED', 'PAYMENT_REFUNDED'];
+  const eventosCancelamento = ['SUBSCRIPTION_INACTIVATED'];
 
   try {
     let novoStatus = null;
@@ -27,6 +28,8 @@ module.exports = async (req, res) => {
     if (eventosSucesso.includes(event)) {
       novoStatus = 'RECEIVED';
     } else if (eventosFalha.includes(event)) {
+      novoStatus = 'SUSPEND';
+    } else if (eventosCancelamento.includes(event)) {
       novoStatus = 'CANCELLED';
     }
 
