@@ -5,8 +5,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// 🔧 REGRAS DE NEGÓCIO
-const CREDITOS_MENSAIS = 1800;
+const CREDITOS_MENSAIS = 1000; // minutos do plano
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
@@ -19,18 +18,15 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: 'Evento inválido' });
   }
 
-  console.log(`[ASAAS] Evento recebido: ${event}`);
-
   try {
     // =================================================
-    // 🔴 0️⃣ CANCELAMENTO TEM PRIORIDADE ABSOLUTA
+    // 🔴 CANCELAMENTO — PRIORIDADE ABSOLUTA
     // =================================================
     if (event === 'SUBSCRIPTION_INACTIVATED') {
       const subscriptionId =
         subscription?.id || payment?.subscription;
 
       if (!subscriptionId) {
-        console.warn('[ASAAS] Cancelamento sem subscription id');
         return res.status(200).send('OK');
       }
 
@@ -38,80 +34,81 @@ module.exports = async (req, res) => {
         .from('profiles')
         .update({
           subscription_status: 'CANCELLED',
+          credits_total: 0,
           credits_remaining: 0
         })
         .eq('subscription', subscriptionId);
-
-      console.log(`[ASAAS] Assinatura ${subscriptionId} CANCELADA`);
 
       return res.status(200).send('OK');
     }
 
     // =================================================
-    // 1️⃣ EVENTOS DE PAGAMENTO (EXIGEM payment.id)
+    // EVENTOS SEM PAYMENT
     // =================================================
     if (!payment?.id) {
       return res.status(200).send('OK');
     }
 
-    // Busca pagamento atual (idempotência por payment.id)
-    const { data: pagamentoAtual, error: fetchError } = await supabase
+    // Busca pagamento atual
+    const { data: pagamentoAtual } = await supabase
       .from('payments')
-      .select('status, paid_at')
+      .select('status, processed, type')
       .eq('asaas_id', payment.id)
       .single();
 
-    if (fetchError || !pagamentoAtual) {
-      console.warn('[ASAAS] Pagamento não encontrado:', payment.id);
+    if (!pagamentoAtual) {
       return res.status(200).send('OK');
     }
 
     // =================================================
-    // 2️⃣ ATUALIZA STATUS DO PAGAMENTO
+    // 🟡 DEFINE O TIPO DO PAGAMENTO (O QUE FALTAVA)
     // =================================================
-    let novoStatusPagamento = pagamentoAtual.status;
-    let marcarComoPago = false;
+    const tipoPagamento = payment.subscription
+      ? 'SUBSCRIPTION'
+      : 'ONE_TIME';
 
-    if (event === 'PAYMENT_CONFIRMED') {
-      novoStatusPagamento = 'RECEIVED';
-    }
-
-    if (event === 'PAYMENT_RECEIVED') {
-      novoStatusPagamento = 'RECEIVED';
-      marcarComoPago = true;
-    }
-
-    if (event === 'PAYMENT_OVERDUE') {
-      novoStatusPagamento = 'SUSPENDED';
-    }
-
-    if (event === 'PAYMENT_REFUNDED') {
-      novoStatusPagamento = 'CANCELLED';
-    }
-
-    if (
-      novoStatusPagamento !== pagamentoAtual.status ||
-      (marcarComoPago && !pagamentoAtual.paid_at)
-    ) {
+    if (!pagamentoAtual.type) {
       await supabase
         .from('payments')
-        .update({
-          status: novoStatusPagamento,
-          paid_at:
-            marcarComoPago && !pagamentoAtual.paid_at
-              ? new Date().toISOString()
-              : pagamentoAtual.paid_at
-        })
+        .update({ type: tipoPagamento })
         .eq('asaas_id', payment.id);
     }
 
     // =================================================
-    // 3️⃣ RENOVA CICLO E CRÉDITOS (SÓ NO RECEIVED)
+    // ATUALIZA STATUS
+    // =================================================
+    let novoStatus = pagamentoAtual.status;
+
+    if (event === 'PAYMENT_CONFIRMED') {
+      novoStatus = 'RECEIVED';
+    }
+
+    if (event === 'PAYMENT_RECEIVED') {
+      novoStatus = 'RECEIVED';
+    }
+
+    if (event === 'PAYMENT_OVERDUE') {
+      novoStatus = 'SUSPENDED';
+    }
+
+    if (event === 'PAYMENT_REFUNDED') {
+      novoStatus = 'CANCELLED';
+    }
+
+    if (novoStatus !== pagamentoAtual.status) {
+      await supabase
+        .from('payments')
+        .update({ status: novoStatus })
+        .eq('asaas_id', payment.id);
+    }
+
+    // =================================================
+    // ASSINATURA → RESET DE CRÉDITOS
     // =================================================
     if (
       event === 'PAYMENT_RECEIVED' &&
       payment.subscription &&
-      !pagamentoAtual.paid_at
+      pagamentoAtual.processed === false
     ) {
       const inicioCiclo = new Date();
       const fimCiclo = payment.dueDate
@@ -128,24 +125,6 @@ module.exports = async (req, res) => {
           current_period_end: fimCiclo ? fimCiclo.toISOString() : null
         })
         .eq('subscription', payment.subscription);
-
-      console.log(
-        `[ASAAS] Ciclo renovado para assinatura ${payment.subscription}`
-      );
-    }
-
-    // =================================================
-    // 4️⃣ INADIMPLÊNCIA → SUSPENDE ASSINATURA
-    // =================================================
-    if (event === 'PAYMENT_OVERDUE' && payment.subscription) {
-      await supabase
-        .from('profiles')
-        .update({
-          subscription_status: 'SUSPENDED'
-        })
-        .eq('subscription', payment.subscription);
-
-      console.log('[ASAAS] Assinatura SUSPENSA por inadimplência');
     }
 
     return res.status(200).send('OK');
